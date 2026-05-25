@@ -1,0 +1,350 @@
+-- ============================================
+-- 1. Создание базы данных (если не существует)
+-- ============================================
+IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = 'LibraryDB')
+BEGIN
+    CREATE DATABASE LibraryDB;
+END;
+GO
+
+USE LibraryDB;
+GO
+
+-- ============================================
+-- 2. Удаление старых таблиц (если нужно пересоздать)
+-- ============================================
+-- ВНИМАНИЕ! Эти команды удалят все данные!
+/*
+IF OBJECT_ID('dbo.book_loans', 'U') IS NOT NULL DROP TABLE dbo.book_loans;
+IF OBJECT_ID('dbo.book_authors', 'U') IS NOT NULL DROP TABLE dbo.book_authors;
+IF OBJECT_ID('dbo.books', 'U') IS NOT NULL DROP TABLE dbo.books;
+IF OBJECT_ID('dbo.readers', 'U') IS NOT NULL DROP TABLE dbo.readers;
+IF OBJECT_ID('dbo.authors', 'U') IS NOT NULL DROP TABLE dbo.authors;
+IF OBJECT_ID('dbo.genres', 'U') IS NOT NULL DROP TABLE dbo.genres;
+GO
+*/
+
+-- ============================================
+-- 3. Создание таблиц
+-- ============================================
+
+-- 3.1. Жанры
+CREATE TABLE genres (
+    genre_id INT IDENTITY(1,1) PRIMARY KEY,
+    genre_name NVARCHAR(50) UNIQUE NOT NULL
+);
+GO
+
+-- 3.2. Авторы
+CREATE TABLE authors (
+    author_id INT IDENTITY(1,1) PRIMARY KEY,
+    last_name NVARCHAR(50) NOT NULL,
+    first_name NVARCHAR(50) NOT NULL,
+    middle_name NVARCHAR(50) NULL
+);
+GO
+
+-- 3.3. Читатели
+CREATE TABLE readers (
+    reader_id INT IDENTITY(1,1) PRIMARY KEY,
+    last_name NVARCHAR(50) NOT NULL,
+    first_name NVARCHAR(50) NOT NULL,
+    middle_name NVARCHAR(50) NULL,
+    birth_date DATE NULL,
+    address NVARCHAR(200) NULL,
+    phone NVARCHAR(20) NULL,
+    email NVARCHAR(100) NULL,
+    registration_date DATE DEFAULT GETDATE(),
+    is_active BIT DEFAULT 1
+);
+GO
+
+-- 3.4. Книги
+CREATE TABLE books (
+    book_id INT IDENTITY(1,1) PRIMARY KEY,
+    isbn NVARCHAR(20) NULL,
+    title NVARCHAR(255) NOT NULL,
+    genre_id INT NULL,
+    publication_year INT NULL,
+    publisher NVARCHAR(100) NULL,
+    page_count INT NULL,
+    total_copies INT NOT NULL CHECK (total_copies >= 0),
+    available_copies INT NOT NULL CHECK (available_copies >= 0),
+    FOREIGN KEY (genre_id) REFERENCES genres(genre_id) ON DELETE SET NULL
+);
+GO
+
+-- 3.5. Связь книг и авторов (многие ко многим)
+CREATE TABLE book_authors (
+    book_id INT NOT NULL,
+    author_id INT NOT NULL,
+    PRIMARY KEY (book_id, author_id),
+    FOREIGN KEY (book_id) REFERENCES books(book_id) ON DELETE CASCADE,
+    FOREIGN KEY (author_id) REFERENCES authors(author_id) ON DELETE CASCADE
+);
+GO
+
+-- 3.6. Выдача книг
+CREATE TABLE book_loans (
+    loan_id INT IDENTITY(1,1) PRIMARY KEY,
+    book_id INT NOT NULL,
+    reader_id INT NOT NULL,
+    loan_date DATE NOT NULL DEFAULT GETDATE(),
+    due_date DATE NOT NULL,
+    return_date DATE NULL,
+    is_returned BIT DEFAULT 0,
+    fine_amount DECIMAL(10,2) DEFAULT 0.00,
+    FOREIGN KEY (book_id) REFERENCES books(book_id),
+    FOREIGN KEY (reader_id) REFERENCES readers(reader_id)
+);
+GO
+
+-- ============================================
+-- 4. Создание индексов для оптимизации
+-- ============================================
+CREATE INDEX idx_loans_reader ON book_loans(reader_id);
+CREATE INDEX idx_loans_book ON book_loans(book_id);
+CREATE INDEX idx_loans_due ON book_loans(due_date) WHERE return_date IS NULL;
+CREATE INDEX idx_books_title ON books(title);
+CREATE INDEX idx_readers_lastname ON readers(last_name);
+CREATE INDEX idx_readers_email ON readers(email);
+CREATE INDEX idx_books_genre ON books(genre_id);
+CREATE INDEX idx_book_authors_book ON book_authors(book_id);
+CREATE INDEX idx_book_authors_author ON book_authors(author_id);
+GO
+
+-- ============================================
+-- 5. Триггеры
+-- ============================================
+
+-- Триггер на выдачу (уменьшаем доступные копии)
+CREATE TRIGGER trg_after_loan_insert
+ON book_loans
+AFTER INSERT
+AS
+BEGIN
+    UPDATE books 
+    SET available_copies = available_copies - 1
+    WHERE book_id IN (SELECT book_id FROM inserted);
+END;
+GO
+
+-- Триггер на возврат (увеличиваем доступные копии)
+CREATE TRIGGER trg_after_loan_update_return
+ON book_loans
+AFTER UPDATE
+AS
+BEGIN
+    IF UPDATE(return_date)
+    BEGIN
+        UPDATE books 
+        SET available_copies = available_copies + 1
+        FROM books b
+        INNER JOIN inserted i ON b.book_id = i.book_id
+        INNER JOIN deleted d ON i.loan_id = d.loan_id
+        WHERE d.return_date IS NULL AND i.return_date IS NOT NULL;
+    END
+END;
+GO
+
+-- ============================================
+-- 6. Хранимая процедура выдачи книги
+-- ============================================
+CREATE OR ALTER PROCEDURE IssueBook
+    @book_id INT,
+    @reader_id INT,
+    @days_to_return INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @available INT;
+    DECLARE @book_exists INT;
+    DECLARE @reader_exists INT;
+    
+    -- Проверяем существование книги
+    SELECT @book_exists = COUNT(*) FROM books WHERE book_id = @book_id;
+    
+    IF @book_exists = 0
+    BEGIN
+        PRINT 'Ошибка: Книга с ID ' + CAST(@book_id AS VARCHAR) + ' не найдена';
+        RETURN;
+    END
+    
+    -- Проверяем существование читателя
+    SELECT @reader_exists = COUNT(*) FROM readers WHERE reader_id = @reader_id;
+    
+    IF @reader_exists = 0
+    BEGIN
+        PRINT 'Ошибка: Читатель с ID ' + CAST(@reader_id AS VARCHAR) + ' не найден';
+        RETURN;
+    END
+    
+    -- Проверяем наличие доступных копий
+    SELECT @available = available_copies FROM books WHERE book_id = @book_id;
+    
+    IF @available > 0
+    BEGIN
+        INSERT INTO book_loans (book_id, reader_id, due_date)
+        VALUES (@book_id, @reader_id, DATEADD(DAY, @days_to_return, GETDATE()));
+        
+        PRINT 'Книга успешно выдана читателю ' + CAST(@reader_id AS VARCHAR);
+    END
+    ELSE
+    BEGIN
+        PRINT 'Ошибка: Нет доступных копий книги';
+    END
+END;
+GO
+
+-- ============================================
+-- 7. Хранимая процедура возврата книги
+-- ============================================
+CREATE OR ALTER PROCEDURE ReturnBook
+    @loan_id INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    UPDATE book_loans 
+    SET return_date = GETDATE(), is_returned = 1 
+    WHERE loan_id = @loan_id;
+    
+    IF @@ROWCOUNT > 0
+        PRINT 'Книга успешно возвращена';
+    ELSE
+        PRINT 'Ошибка: Выдача с ID ' + CAST(@loan_id AS VARCHAR) + ' не найдена';
+END;
+GO
+
+-- ============================================
+-- 8. Представления (VIEW) для отчётов
+-- ============================================
+
+-- Список должников
+CREATE OR ALTER VIEW debtors_view AS
+SELECT 
+    r.last_name + ' ' + r.first_name AS Читатель,
+    r.phone AS Телефон,
+    b.title AS Книга,
+    l.due_date AS Срок_возврата,
+    DATEDIFF(DAY, l.due_date, GETDATE()) AS Дней_просрочки,
+    DATEDIFF(DAY, l.due_date, GETDATE()) * 0.50 AS Штраф
+FROM book_loans l
+JOIN readers r ON l.reader_id = r.reader_id
+JOIN books b ON l.book_id = b.book_id
+WHERE l.return_date IS NULL AND l.due_date < GETDATE();
+GO
+
+-- Популярность книг
+CREATE OR ALTER VIEW book_popularity AS
+SELECT 
+    b.title AS Книга,
+    COUNT(l.loan_id) AS Количество_выдач,
+    b.total_copies AS Всего_экземпляров,
+    b.available_copies AS Доступно
+FROM books b
+LEFT JOIN book_loans l ON b.book_id = l.book_id
+GROUP BY b.book_id, b.title, b.total_copies, b.available_copies;
+GO
+
+-- ============================================
+-- 9. Вставка тестовых данных (жанры)
+-- ============================================
+INSERT INTO genres (genre_name) VALUES
+(N'Роман'),
+(N'Детектив'),
+(N'Фантастика'),
+(N'Научная литература'),
+(N'Поэзия'),
+(N'Фэнтези'),
+(N'Исторический роман'),
+(N'Приключения'),
+(N'Триллер'),
+(N'Ужасы');
+GO
+
+-- ============================================
+-- 10. Вставка тестовых данных (авторы)
+-- ============================================
+INSERT INTO authors (last_name, first_name, middle_name) VALUES
+(N'Достоевский', N'Фёдор', N'Михайлович'),
+(N'Толстой', N'Лев', N'Николаевич'),
+(N'Кинг', N'Стивен', N'Эдвин'),
+(N'Пушкин', N'Александр', N'Сергеевич'),
+(N'Булгаков', N'Михаил', N'Афанасьевич'),
+(N'Оруэлл', N'Джордж', N''),
+(N'Брэдбери', N'Рэй', N'Дуглас'),
+(N'Гоголь', N'Николай', N'Васильевич'),
+(N'Хемингуэй', N'Эрнест', N'Миллер'),
+(N'Фицджеральд', N'Фрэнсис', N'Скотт');
+GO
+
+-- ============================================
+-- 11. Вставка тестовых данных (читатели)
+-- ============================================
+INSERT INTO readers (last_name, first_name, middle_name, birth_date, address, phone, email, registration_date, is_active) VALUES
+(N'Иванов', N'Иван', N'Иванович', '1990-05-12', N'ул. Ленина, д.1', N'79123456789', N'ivanov@mail.ru', GETDATE(), 1),
+(N'Петрова', N'Мария', N'Сергеевна', '1985-08-23', N'ул. Советская, д.10', N'79123456790', N'petrova@mail.ru', GETDATE(), 1),
+(N'Сидоров', N'Алексей', N'Петрович', '1995-03-15', N'пр. Мира, д.25', N'79123456791', N'sidorov@mail.ru', GETDATE(), 1),
+(N'Кузнецова', N'Елена', N'Александровна', '2000-07-07', N'ул. Гагарина, д.5', N'79123456792', N'kuznecova@mail.ru', GETDATE(), 1),
+(N'Михайлов', N'Дмитрий', N'Владимирович', '1988-11-30', N'ул. Пушкина, д.15', N'79123456793', N'mikhaylov@mail.ru', GETDATE(), 1);
+GO
+
+-- ============================================
+-- 12. Вставка тестовых данных (книги)
+-- ============================================
+INSERT INTO books (title, isbn, genre_id, publication_year, publisher, page_count, total_copies, available_copies) VALUES
+(N'Преступление и наказание', '978-5-17-118908-4', 1, 1866, N'Русский вестник', 672, 3, 3),
+(N'Война и мир', '978-5-17-118908-5', 1, 1869, N'Русский вестник', 1296, 5, 5),
+(N'Сияние', '978-5-17-118908-6', 10, 1977, N'Doubleday', 512, 2, 2),
+(N'Евгений Онегин', '978-5-17-118908-7', 5, 1833, N'Современник', 320, 4, 4),
+(N'Мастер и Маргарита', '978-5-17-118908-8', 1, 1967, N'Москва', 480, 3, 3),
+(N'1984', '978-5-17-118908-9', 3, 1949, N'Secker & Warburg', 328, 3, 3),
+(N'451 градус по Фаренгейту', '978-5-17-118909-0', 3, 1953, N'Ballantine Books', 256, 2, 2),
+(N'Мертвые души', '978-5-17-118909-1', 1, 1842, N'Москва', 352, 2, 2),
+(N'Старик и море', '978-5-17-118909-2', 1, 1952, N'Scribner', 320, 3, 3),
+(N'Великий Гэтсби', '978-5-17-118909-3', 1, 1925, N'Scribner', 208, 4, 4);
+GO
+
+-- ============================================
+-- 13. Вставка связей книг и авторов
+-- ============================================
+INSERT INTO book_authors (book_id, author_id) VALUES
+(1,1), (2,2), (3,3), (4,4), (5,5), (6,6), (7,7), (8,8), (9,9), (10,10);
+GO
+
+-- ============================================
+-- 14. Вставка тестовых выдач (через процедуру)
+-- ============================================
+EXEC IssueBook 1, 1, 14;
+EXEC IssueBook 2, 2, 7;
+EXEC IssueBook 3, 3, 21;
+EXEC IssueBook 4, 4, 10;
+EXEC IssueBook 5, 5, 14;
+EXEC IssueBook 6, 1, 30;
+EXEC IssueBook 7, 2, 14;
+EXEC IssueBook 8, 3, 7;
+EXEC IssueBook 9, 4, 14;
+EXEC IssueBook 10, 5, 21;
+GO
+
+-- ============================================
+-- 15. Итоговая проверка
+-- ============================================
+PRINT '========================================';
+PRINT '   БАЗА ДАННЫХ LIBRARYDB СОЗДАНА';
+PRINT '========================================';
+PRINT '';
+
+SELECT 'genres' AS Таблица, COUNT(*) AS Количество FROM genres
+UNION ALL
+SELECT 'authors', COUNT(*) FROM authors
+UNION ALL
+SELECT 'readers', COUNT(*) FROM readers
+UNION ALL
+SELECT 'books', COUNT(*) FROM books
+UNION ALL
+SELECT 'book_authors', COUNT(*) FROM book_authors
+UNION ALL
+SELECT 'book_loans', COUNT(*) FROM book_loans;
+GO
